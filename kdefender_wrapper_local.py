@@ -1,97 +1,131 @@
-import json
-import asyncio
+import asyncio, aiohttp, re
 from functools import wraps
 from typing import Optional
-
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-
-API_ID = 0
-API_HASH = ""
-SESSION = ""
-GROUP_ID = 0          # group/supergroup/channel id (int)
-K_DEFENDER_ID = 0     # bot id (int)
-CHAT_TOKEN = ""
+from deep_translator import GoogleTranslator
 
 _bot = None
-_mt: Optional[TelegramClient] = None
-_lock = asyncio.Lock()
+URL = ""
+CHAT_TOKEN = ""
+LANG = ""
+BOT_ID = None
+_session: aiohttp.ClientSession | None = None
+_translate_cache: dict[tuple[str, str], str] = {}
 
-KDEFENDER_CMD = {"/start", "/help", "/get_info", "/settings", "/menu"}
 
-
-class KDefenderNotReady(RuntimeError):
+class KDefenderNotReady(SystemError):
     pass
 
 
 async def setup(
     bot=None,
-    api_id=None,
-    api_hash=None,
-    session=None,
-    group_id=None,
+    url=None,
     chat_token=None,
-    kdefender_id=None,
+    lang=None,
+    timeout=5
 ):
     """
-    One-line setup:
-        await setup(bot=bot, api_id=..., api_hash=..., session=..., group_id=..., chat_token=..., kdefender_id=...)
+    Languages:
+    - English (en)
+    - Русский (ru)
+    - Español (es)
+    - Deutsch (de)
+    - Français (fr)
+    - Українська (uk)
+    - etc in deep_translator (GoogleTranslator)
     """
     missing = []
-    if bot is None:
+    if not bot:
         missing.append("bot")
-    if not api_id:
-        missing.append("api_id")
-    if not api_hash:
-        missing.append("api_hash")
-    if not session:
-        missing.append("session")
-    if not group_id:
-        missing.append("group_id")
+    if not url:
+        missing.append("url")
     if not chat_token:
         missing.append("chat_token")
-    if not kdefender_id:
-        missing.append("kdefender_id")
+    if not lang:
+        missing.append("lang")
 
     if missing:
-        raise KDefenderNotReady("K-Defender wrapper not configured. Missing: " + ", ".join(missing))
+        raise KDefenderNotReady(
+            "K-Defender wrapper not configured. Missing: " + ", ".join(missing)
+        )
+    
+    if url.endswith("/"):
+        url = url[:-1]
 
-    global _bot, _mt, API_ID, API_HASH, SESSION, GROUP_ID, CHAT_TOKEN, K_DEFENDER_ID
-    API_ID = int(api_id)
-    API_HASH = str(api_hash)
-    SESSION = str(session)
-    GROUP_ID = int(group_id)
+    global URL, CHAT_TOKEN, LANG, BOT_ID, _bot, _session
+
+    if _session and not _session.closed:
+        raise KDefenderNotReady("await setup(...) has already been called. Call await close() before re-initializing.")
+
+    try:
+        _session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        )
+
+        async with _session.get(f"{url}/status/") as resp:
+            if resp.status != 200:
+                await _session.close()
+                raise KDefenderNotReady("K-Defender URL is not reachable or valid.")
+
+    except asyncio.TimeoutError:
+        if _session:
+            await _session.close()
+        raise KDefenderNotReady("K-Defender server timed out.")
+
+    except aiohttp.ClientError:
+        if _session:
+            await _session.close()
+        raise KDefenderNotReady("K-Defender URL is invalid or unreachable.")
+
+    LANG = str(lang)
+    URL = str(url)
     CHAT_TOKEN = str(chat_token)
-    K_DEFENDER_ID = int(kdefender_id)
     _bot = bot
-
-    # Start Telethon (MTProto user client)
-    if _mt is None:
-        _mt = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-        await _mt.start()
-    elif not _mt.is_connected():
-        await _mt.connect()
+    me = await bot.get_me()
+    BOT_ID = me.id
 
 
-async def close():
-    global _mt
-    if _mt and _mt.is_connected():
-        await _mt.disconnect()
-    _mt = None
+def tr(text: str) -> str:
+    global LANG, _translate_cache
+    lang = LANG
+    if lang == "en" or not text:
+        return text
 
+    cache_key = (lang, text)
+    if cache_key in _translate_cache:
+        return _translate_cache[cache_key]
 
-def _strip_kdefender_command(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return ""
+    parts = re.split(r"(<pre>.*?</pre>|<code>.*?</code>)", text, flags=re.DOTALL | re.IGNORECASE)
+    out = []
+    translator = GoogleTranslator(source="auto", target=lang)
+    for part in parts:
+        if not part:
+            continue
+        if part.lower().startswith("<pre>") or part.lower().startswith("<code>"):
+            out.append(part)
+            continue
+        if not part.strip():
+            out.append(part)
+            continue
 
-    for cmd in KDEFENDER_CMD:
-        if t == cmd:
-            return ""
-        if t.startswith(cmd + " "):
-            return t[len(cmd):].lstrip()
-    return t
+        left_trim = len(part) - len(part.lstrip())
+        right_trim = len(part) - len(part.rstrip())
+        core = part.strip()
+        if not core:
+            out.append(part)
+            continue
+        try:
+            translated_part = translator.translate(core)
+            if not isinstance(translated_part, str) or translated_part is None:
+                translated_part = core
+            out.append(part[:left_trim] + translated_part + (part[len(part) - right_trim:] if right_trim else ""))
+        except Exception:
+            out.append(part)
+    translated = "".join(out)
+    _translate_cache[cache_key] = translated
+    return translated
 
+async def tr_async(text: str) -> str:
+    return await asyncio.to_thread(tr, text)
 
 def _extract_user_text(update) -> Optional[str]:
     # Message-like
@@ -126,114 +160,140 @@ def _blocked_reply_target(update):
 
 async def _send_and_wait_verdict(text: str, timeout: int = 10) -> bool:
     """
-    Sends to GROUP via MTProto:
-        "<bot_id> | <text> | <CHAT_TOKEN>"
-    Waits for K-Defender JSON verdict message in the same group.
+    Sends to server:
+        {
+        "bot_id": <bot_id>,
+        "text": <user_text>,
+        "token": <CHAT_TOKEN>
+        }
+    Waits for K-Defender JSON verdict message.
 
     Returns:
         True  -> ok
         False -> blocked/timeout/error
     """
-    if _mt is None:
-        raise KDefenderNotReady("Call await setup(...) before using @kdefender_check().")
 
-    global _bot
-    users_bot = await _bot.get_me()
+    global _bot, URL, CHAT_TOKEN, BOT_ID, _session
 
-    payload = f"{users_bot.id} | {text} | {CHAT_TOKEN}"
+    if not _session or _session.closed:
+        raise KDefenderNotReady("HTTP session not initialized. Call setup().")
 
-    async with _lock:
-        got_reply = asyncio.Event()
-        verdict_ok = False
+    if not URL or not CHAT_TOKEN or not _bot:
+        raise KDefenderNotReady("Call await setup(...) before using decorator.")
 
-        def _try_parse_json_from_message(raw: str):
-            if not raw:
-                return None
-            
-            for line in raw.splitlines():
-                s = line.strip()
-                if s.startswith("{") and s.endswith("}"):
-                    try:
-                        return json.loads(s)
-                    except Exception:
-                        continue
-            return None
+    
 
-        async def handler(event):
-            nonlocal verdict_ok
-            raw = (event.raw_text or "").strip()
-            data = _try_parse_json_from_message(raw)
-            if not isinstance(data, dict):
-                return
-            if "result" not in data:
-                return
+    payload = {
+        "bot_id": BOT_ID,
+        "text": text,
+        "token": CHAT_TOKEN
+    }
 
-            verdict_ok = (data.get("result") == "ok")
-            got_reply.set()
+    try:
+        async with _session.post(
+            URL + "/check/",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as response:
 
-        event_filter = events.NewMessage(chats=GROUP_ID, from_users=K_DEFENDER_ID, incoming=True)
-        _mt.add_event_handler(handler, event_filter)
+            if response.status != 200:
+                return False
 
-        try:
-            await _mt.send_message(GROUP_ID, payload)
-            await asyncio.wait_for(got_reply.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            verdict_ok = False
-        finally:
             try:
-                _mt.remove_event_handler(handler, event_filter)
-            except Exception:
-                pass
+                verdict = await response.json()
+            except aiohttp.ContentTypeError:
+                return False
 
-        return verdict_ok
+            return verdict.get("result") == "ok"
+
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return False
 
 
-def kdefender_check(timeout: int = 10):
+
+def kdefender_check(param = None, timeout: int = 10):
     """
-    Decorator:
+    Usage:
+
         @kdefender_check()
-        async def handler(message): ...
+        async def handler(message: Message):
 
-    Flow:
-      - extracts user text
-      - skips messages from GROUP_ID
-      - strips kdefender commands (/start ...)
-      - sends to K-Defender via MTProto-group relay
-      - blocks if verdict != ok
+    or strict mode:
+
+        @kdefender_check(param="message")
+        async def handler(message: Message):
+
+    If param is defined and not found → raises error.
     """
+
     def deco(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            # find update-like object
+
             update = None
-            for a in args:
-                if hasattr(a, "chat") or hasattr(a, "data") or hasattr(a, "from_user"):
-                    update = a
-                    break
-            if update is None:
-                update = next(iter(kwargs.values()), None)
+
+            # ---------- STRICT MODE ----------
+            if param:
+                if param in kwargs:
+                    update = kwargs[param]
+                else:
+                    from inspect import signature
+
+                    sig = signature(func)
+                    params = list(sig.parameters.keys())
+
+                    if param not in params:
+                        raise KDefenderNotReady(
+                            f"kdefender_check: parameter '{param}' "
+                            f"not found in function '{func.__name__}'"
+                        )
+
+                    index = params.index(param)
+                    if index < len(args):
+                        update = args[index]
+
+                if update is None:
+                    raise KDefenderNotReady(
+                        f"kdefender_check: argument '{param}' "
+                        f"was not passed at runtime"
+                    )
+
+            # ---------- AUTO MODE ----------
+            else:
+                for a in args:
+                    if hasattr(a, "chat") or hasattr(a, "data") or hasattr(a, "from_user"):
+                        update = a
+                        break
+                if update is None:
+                    update = next(iter(kwargs.values()), None)
 
             if not update:
                 return await func(*args, **kwargs)
 
-            # skip traffic inside defender group itself
-            chat = getattr(update, "chat", None)
-            chat_id = getattr(chat, "id", None)
-            if chat_id == GROUP_ID:
-                return
-
             text = _extract_user_text(update)
-            text = _strip_kdefender_command(text or "")
             if not text:
                 return await func(*args, **kwargs)
 
             ok = await _send_and_wait_verdict(text, timeout=timeout)
+
             if not ok:
                 target = _blocked_reply_target(update)
                 if target:
-                    await target.answer("Message blocked by 🛡️K-Defender🔐")
+                    await target.answer(await tr_async("Message blocked due to security reasons."))
                 return
 
             return await func(*args, **kwargs)
+
         return wrapper
     return deco
+
+async def close():
+    global _session, _bot, URL, CHAT_TOKEN, LANG, BOT_ID
+    if _session and not _session.closed:
+        await _session.close()
+    _session = None
+    _bot = None
+    URL = ""
+    CHAT_TOKEN = ""
+    LANG = ""
+    BOT_ID = None
