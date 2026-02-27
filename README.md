@@ -128,7 +128,7 @@ Telegram-бот K-Defender используется как главный ком
      git clone https://github.com/FIRE-K/K-Defender.git
      ```
      или нажать кнопку Code и выбрать опцию `Скачать ZIP/Download ZIP`, после чего распаковать архив в нужном каталоге
-   * указать в .env требуемые данные (TOKEN нужно получить у Bot Father, KDEFENDER_API_BASE -- api для инструкций)
+   * указать в .env требуемые данные (TOKEN нужно получить у Bot Father, KDEFENDER_API_BASE -- api для webhook/инструкций/`web-api.py`)
      ```.env
      TOKEN=<...>
      KDEFENDER_API_BASE=<...>
